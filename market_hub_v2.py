@@ -440,7 +440,10 @@ class RqDataUpdater:
         return rq
 
     def _switch_key_if_needed(self, threshold=0.80):
-        """检查配额，超过阈值自动切换下一个可用key(循环尝试所有剩余key)"""
+        """检查配额，超过阈值自动切换下一个可用key(循环尝试所有剩余key)
+        
+        返回: True=切换成功, False=所有Key配额不足(应停止下载)
+        """
         try:
             quota = self._rq.user.get_quota()
             pct = quota['bytes_used'] / quota['bytes_limit']
@@ -461,7 +464,7 @@ class RqDataUpdater:
                     except Exception as e:
                         log.warning(f"Key{next_idx+1}连接失败: {e}")
                         continue
-                log.error(f"⚠ 所有{len(LICENSES)}个Key配额均不足")
+                log.error(f"⚠ 所有{len(LICENSES)}个Key配额均不足，停止下载")
             return False
         except Exception as e:
             log.error(f"配额检查异常: {e}")
@@ -802,12 +805,15 @@ class RqDataUpdater:
 
             except Exception as e:
                 err_str = str(e)[:150]
-                log.error(f"    {freq_label}批次{batch_num}/{total_batches}失败: {err_str}")
-                failed += len(batch)
-                if 'quota' in err_str.lower() or 'limit' in err_str.lower():
+                # 配额耗尽/连接数超限 → 尝试切换Key
+                if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                     if not self._switch_key_if_needed(0.5):
-                        log.error("  ⚠ 所有Key配额耗尽，停止当日下载")
+                        log.error(f"  ⚠ 所有Key配额耗尽，停止当日下载 — 最后错误: {err_str}")
                         break
+                    continue  # 切换成功,重试本批次
+                else:
+                    log.error(f"    {freq_label}批次{batch_num}/{total_batches}失败: {err_str}")
+                    failed += len(batch)
 
             if batch_num % 50 == 0 or batch_num == total_batches:
                 log.info(f"  {freq_label}当日进度: {batch_num}/{total_batches}批 "
@@ -1089,13 +1095,17 @@ class RqDataUpdater:
 
             except Exception as e:
                 err_str = str(e)[:150]
-                log.error(f"    {freq_label}[{day_str}]批次{batch_num}/{total_batches}失败: {err_str}")
-                failed += len(batch)
-                if 'quota' in err_str.lower() or 'limit' in err_str.lower():
+                # 配额耗尽/连接数超限 → 尝试切换Key
+                if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                     if not self._switch_key_if_needed(0.5):
-                        log.error("  ⚠ 所有Key配额耗尽，停止补齐(明日23:00继续)")
+                        log.error(f"  ⚠ 所有Key配额耗尽，停止补齐(明日23:00继续) — 最后错误: {err_str}")
                         self._running = False
                         return done, failed
+                    # 切换成功,继续重试本批次
+                    continue
+                else:
+                    log.error(f"    {freq_label}[{day_str}]批次{batch_num}/{total_batches}失败: {err_str}")
+                    failed += len(batch)
 
             time.sleep(0.2)
 
@@ -1227,17 +1237,20 @@ class RqDataUpdater:
 
                 except Exception as e:
                     err_str = str(e)[:100]
-                    log.error(f"    {rq_code} {freq_label}[{seg_start}→{seg_end}]失败: {err_str}")
-                    failed += 1
-                    if 'quota' in err_str.lower() or 'limit' in err_str.lower():
+                    # 配额耗尽/连接数超限 → 尝试切换Key
+                    if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                         if not self._switch_key_if_needed(0.5):
-                            log.error("  ⚠ 所有Key配额耗尽，停止历史补齐(明日23:00继续)")
+                            log.error(f"  ⚠ 所有Key配额耗尽，停止历史补齐(明日23:00继续) — 最后错误: {err_str}")
                             # 配额耗尽前先保存已下载的数据
                             if stock_dfs:
                                 combined = pd.concat(stock_dfs, ignore_index=True)
                                 self._save_stock_parquet(rq_code, combined, data_dir)
-                            log.info(f"  ✓ {freq_label}补齐中断: 成功{done} 失败{failed} 拒绝{rejected}")
+                            self._running = False
                             return
+                        continue  # 切换成功,重试本段
+                    else:
+                        log.error(f"    {rq_code} {freq_label}[{seg_start}→{seg_end}]失败: {err_str}")
+                        failed += 1
 
             # 该股所有段下载完成，一次性合并保存
             if stock_dfs:
@@ -1336,13 +1349,15 @@ class RqDataUpdater:
 
                 except Exception as e:
                     err_str = str(e)[:100]
-                    log.error(f"    {rq_code} 开盘tick失败: {err_str}")
-                    failed += 1
-                    if 'quota' in err_str.lower() or 'limit' in err_str.lower():
+                    # 配额耗尽/连接数超限 → 尝试切换Key
+                    if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                         if not self._switch_key_if_needed(0.5):
-                            log.error("  ⚠ 所有Key配额耗尽，停止开盘tick下载")
-                            log.info(f"  ✓ 开盘tick下载中断: 成功{done} 失败{failed}")
+                            log.error(f"  ⚠ 所有Key配额耗尽，停止开盘tick下载 — 最后错误: {err_str}")
                             return
+                        continue  # 切换成功,重试
+                    else:
+                        log.error(f"    {rq_code} 开盘tick失败: {err_str}")
+                        failed += 1
 
             if batch_num % 100 == 0 or batch_num == total_batches:
                 log.info(f"  开盘tick进度: {batch_num}/{total_batches}批 "
