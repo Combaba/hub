@@ -1,6 +1,6 @@
-# Hub — 统一行情中心 + 华鑫交易网关
+# Hub — 统一行情中心 + 交易网关
 
-A股交易系统核心基础设施，提供实时行情分发和仿真交易网关服务。
+A股交易系统核心基础设施，提供实时行情分发和交易网关服务。支持两套数据源+交易通道，接口完全兼容，策略程序无需修改即可切换。
 
 ## 组件
 
@@ -8,6 +8,43 @@ A股交易系统核心基础设施，提供实时行情分发和仿真交易网�
 |---|---|---|---|
 | **MarketHub v2** | `market_hub_v2.py` | :19800-19803 | 统一行情中心 — ZMQ订阅herzqt实时行情 + 米筐日更 + FastAPI |
 | **华鑫交易网关** | `huaxin_trade_gateway.py` | :19850 | 华鑫SDK仿真交易 — ZMQ REP买卖委托 + 查询接口 |
+| **QMT Hub** | `qmt_hub.py` | :19800-19803, :19850 | miniQMT行情+交易中心 — 接口与上述两组件完全兼容 |
+
+## QMT Hub
+
+miniQMT版统一行情+交易中心，接口与MarketHub v2 + 华鑫交易网关完全兼容。策略程序仅切换连接目标即可从herzqt+华鑫切换到miniQMT。
+
+### 数据流
+```
+xtdata.get_full_tick() ──poll──▸ QMT Hub
+                                   ├─ ZMQ PUB :19800  [snap]  快照分发
+                                   ├─ ZMQ PUB :19801  [bar]   1m K线分发
+                                   ├─ ZMQ REP :19802  [query] ZMQ行情查询
+                                   ├─ FastAPI :19803  [http]  Web API
+                                   ├─ ZMQ REP :19850  [trade] 交易网关
+                                   └─ 文件保存 tick→parquet
+```
+
+### 行情兼容
+- ZMQ PUB/REP协议、FastAPI端点、快照字段格式与MarketHub v2完全一致
+- QMT tick字段自动映射: `lastPrice→last_price`, `lastClose→pre_close`, `amount→turnover`, `askPrice[]→ask1~ask5` 等
+- K线聚合、tick保存复用MarketHub v2的`BarAggregator`和`TickSaver`
+
+### 交易兼容
+- ZMQ REP :19850协议与华鑫交易网关完全一致
+- 支持所有action: `ping | buy | sell | query_account | query_position | query_orders | query_trades`
+- 支持LIMIT/MARKET订单类型
+
+### 运行
+```bash
+python qmt_hub.py --qmt-path "D:/QMTgj/userdata_mini" --account 8884972726
+python qmt_hub.py --qmt-path "D:/QMTgj/userdata_mini" --account 8884972726 --dry-run
+```
+
+### 测试
+```bash
+pytest test_qmt_hub.py -v
+```
 
 ## MarketHub v2
 
@@ -86,11 +123,13 @@ python -u huaxin_trade_gateway.py
 ## 测试
 
 ```bash
-# 单元测试(不需要服务运行)
+# MarketHub v2 单元测试(不需要服务运行)
 pytest test_market_hub_v2.py -v
-pytest test_trading_system_integration.py -v -m unit
 
-# 集成测试(需要MarketHub + 华鑫网关运行)
+# QMT Hub 单元测试(不需要服务运行)
+pytest test_qmt_hub.py -v
+
+# 三服务集成测试(需要MarketHub + 华鑫网关运行)
 pytest test_trading_system_integration.py -v -m "integration and not live"
 
 # 盘中实战测试
