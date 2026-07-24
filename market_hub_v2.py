@@ -1420,6 +1420,11 @@ class MarketHubV2:
         self._index_codes = set()
         self._last_report = 0
 
+        # ZMQ自动重连: 连续N分钟0消息则重建socket
+        self._reconnect_threshold = 3  # 连续3分钟0消息触发重连
+        self._zero_msg_minutes = 0
+        self._last_msg_minute = 0
+
     def connect(self):
         """连接远程ZMQ + 启动本地PUB/REP"""
         self._remote_sub = self._ctx.socket(zmq.SUB)
@@ -1427,6 +1432,8 @@ class MarketHubV2:
         self._remote_sub.setsockopt(zmq.RCVTIMEO, 5000)
         self._remote_sub.setsockopt(zmq.RCVHWM, 500000)
         self._remote_sub.setsockopt(zmq.LINGER, 0)
+        self._remote_sub.setsockopt(zmq.RECONNECT_IVL, 1000)     # 首次重连1秒
+        self._remote_sub.setsockopt(zmq.RECONNECT_IVL_MAX, 5000) # 最大重连间隔5秒
         addr = f'tcp://{self.zmq_host}:{self.zmq_port}'
         self._remote_sub.connect(addr)
         log.info(f"✅ 远程ZMQ连接: {addr}")
@@ -1447,6 +1454,48 @@ class MarketHubV2:
         log.info(f"✅ 查询REP: tcp://*:{self.query_port}")
 
         return True
+
+    def _reconnect_remote(self):
+        """ZMQ SUB自动重连: 关闭旧socket, 重建新socket"""
+        try:
+            if self._remote_sub is not None:
+                self._remote_sub.close()
+        except Exception:
+            pass
+        self._remote_sub = self._ctx.socket(zmq.SUB)
+        self._remote_sub.setsockopt_string(zmq.SUBSCRIBE, '')
+        self._remote_sub.setsockopt(zmq.RCVTIMEO, 5000)
+        self._remote_sub.setsockopt(zmq.RCVHWM, 500000)
+        self._remote_sub.setsockopt(zmq.LINGER, 0)
+        # ZMQ重连策略: 快速重试
+        self._remote_sub.setsockopt(zmq.RECONNECT_IVL, 1000)     # 首次1秒
+        self._remote_sub.setsockopt(zmq.RECONNECT_IVL_MAX, 5000) # 最大5秒
+        addr = f'tcp://{self.zmq_host}:{self.zmq_port}'
+        self._remote_sub.connect(addr)
+        self._zero_msg_minutes = 0
+        log.warning(f"🔄 ZMQ SUB自动重连: {addr}")
+
+    def _check_zmq_health(self):
+        """检测ZMQ数据健康度: 盘中连续N分钟0消息则重连"""
+        now_min = int(time.time()) // 60
+        # 只在盘中检测 (9:15~15:05)
+        from datetime import datetime
+        now = datetime.now()
+        t = now.hour * 100 + now.minute
+        in_market = (915 <= t <= 1505)
+        if not in_market:
+            self._zero_msg_minutes = 0
+            return
+
+        if self._msg_count > self._last_msg_minute:
+            # 有新消息
+            self._last_msg_minute = self._msg_count
+            self._zero_msg_minutes = 0
+        else:
+            self._zero_msg_minutes += 1
+            if self._zero_msg_minutes >= self._reconnect_threshold:
+                log.error(f"⚠️ ZMQ数据中断{self._zero_msg_minutes}分钟, 触发自动重连!")
+                self._reconnect_remote()
 
     def _process_remote_msg(self, frames):
         """处理远程ZMQ消息"""
@@ -1701,6 +1750,9 @@ class MarketHubV2:
 
                 # 统计
                 self._report_stats()
+
+                # ZMQ数据健康检测(每分钟)
+                self._check_zmq_health()
 
                 # 定时任务
                 self._check_scheduled_tasks()
