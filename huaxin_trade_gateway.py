@@ -100,6 +100,9 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
         self._qry_id = 0
         self._qry_results = {}   # {request_id: {'event': Event, 'data': []}}
         self._qry_lock = threading.Lock()
+        # 重连相关
+        self._disconnected = False
+        self._reconnect_requested = False
 
     def _next_qry_id(self):
         with self._qry_lock:
@@ -110,11 +113,14 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
 
     def OnFrontConnected(self):
         log("✅ 华鑫交易前置连接成功")
+        self._disconnected = False
         self._login()
 
     def OnFrontDisconnected(self, nReason):
         log("❌ 华鑫交易断开, reason=%s" % nReason)
         self.logged_in = False
+        self._disconnected = True
+        self._reconnect_requested = True
 
     def _login(self):
         req = traderapi.CTORATstpReqUserLoginField()
@@ -528,6 +534,11 @@ class TradeGateway:
         self.trader_spi = None
         self.zmq_ctx = None
         self.zmq_socket = None
+        # 健康检查
+        self._health_thread = None
+        self._running = False
+        self._last_ping_ok = True
+        self._consecutive_fail = 0
 
     def connect_huaxin(self):
         """连接华鑫交易前置"""
@@ -546,6 +557,117 @@ class TradeGateway:
             return False
         return True
 
+    def _reconnect_huaxin(self):
+        """华鑫交易断线重连: 销毁旧API, 重建新连接"""
+        try:
+            if self.trader_api:
+                try:
+                    self.trader_api.Release()
+                except Exception:
+                    pass
+        except Exception as e:
+            log("⚠️ 释放旧API异常: %s" % e)
+
+        log("🔄 华鑫交易重连中...")
+        self.trader_api = traderapi.CTORATstpTraderApi.CreateTstpTraderApi('')
+        self.trader_spi = HuaxinTraderSpi(self.trader_api, self.cfg)
+        self.trader_api.RegisterSpi(self.trader_spi)
+        self.trader_api.RegisterFront(self.cfg['td_front'])
+        self.trader_api.Init()
+
+        if not self.trader_spi.login_event.wait(timeout=30):
+            log("❌ 华鑫交易重连登录超时")
+            return False
+        if not self.trader_spi.logged_in:
+            log("❌ 华鑫交易重连登录失败")
+            return False
+        log("✅ 华鑫交易重连成功")
+        self._consecutive_fail = 0
+        return True
+
+    def _is_trading_hours(self):
+        """是否在交易时段 (9:10~15:10), 午休11:35~12:55不算断线"""
+        now = datetime.now()
+        t = now.hour * 100 + now.minute
+        # 盘前: 9:10 ~ 9:30
+        if 910 <= t < 930:
+            return True
+        # 上午盘: 9:30 ~ 11:35
+        if 930 <= t <= 1135:
+            return True
+        # 午休: 不检测
+        if 1135 < t < 1255:
+            return False
+        # 下午盘: 12:55 ~ 15:10
+        if 1255 <= t <= 1510:
+            return True
+        return False
+
+    def _is_lunch_break(self):
+        """是否午休时段"""
+        t = datetime.now().hour * 100 + datetime.now().minute
+        return 1130 <= t < 1300
+
+    def _health_check_loop(self):
+        """健康检查线程: 盘中每分钟检测, 断线自动重连"""
+        log("🏥 健康检查线程启动 (盘中每分钟检测)")
+        while self._running:
+            try:
+                time.sleep(60)
+                if not self._running:
+                    break
+                # 非交易时段不检测
+                if not self._is_trading_hours():
+                    continue
+
+                spi = self.trader_spi
+                if spi is None:
+                    continue
+
+                # 检查1: SDK回调已标记断线 → 立即重连
+                if spi._disconnected or not spi.logged_in:
+                    self._consecutive_fail += 1
+                    log("⚠️ 华鑫交易状态异常 (disconnected=%s logged_in=%s 连续失败%d次)" %
+                        (spi._disconnected, spi.logged_in, self._consecutive_fail))
+
+                    if not self._is_lunch_break():
+                        log("🔄 触发自动重连...")
+                        if self._reconnect_huaxin():
+                            log("✅ 自动重连成功")
+                            self._last_ping_ok = True
+                        else:
+                            log("❌ 自动重连失败, 下轮继续")
+                            self._last_ping_ok = False
+                    else:
+                        log("⏸️ 午休时段, 延后重连")
+                    continue
+
+                # 检查2: ping检测 — 主动发查询确认连接存活
+                try:
+                    result = spi.query_account()
+                    if result.get('ok'):
+                        self._consecutive_fail = 0
+                        self._last_ping_ok = True
+                    else:
+                        self._consecutive_fail += 1
+                        log("⚠️ 华鑫查询异常: %s (连续%d次)" % (result, self._consecutive_fail))
+                        self._last_ping_ok = False
+                except Exception as e:
+                    self._consecutive_fail += 1
+                    log("⚠️ 华鑫查询超时: %s (连续%d次)" % (e, self._consecutive_fail))
+                    self._last_ping_ok = False
+
+                # 连续3次失败触发重连
+                if self._consecutive_fail >= 3 and not self._is_lunch_break():
+                    log("⚠️ 连续%d次健康检查失败, 触发主动重连!" % self._consecutive_fail)
+                    if self._reconnect_huaxin():
+                        log("✅ 主动重连成功")
+                    else:
+                        log("❌ 主动重连失败, 下轮继续")
+
+            except Exception as e:
+                log("⚠️ 健康检查异常: %s" % e)
+
     def start_zmq(self, port):
         """启动ZMQ REP服务"""
         self.zmq_ctx = zmq.Context()
@@ -560,7 +682,13 @@ class TradeGateway:
         action = req.get('action', '')
 
         if action == 'ping':
-            return {"ok": True, "status": "alive", "logged_in": self.trader_spi.logged_in}
+            return {
+                "ok": True,
+                "status": "alive",
+                "logged_in": self.trader_spi.logged_in,
+                "disconnected": self.trader_spi._disconnected,
+                "consecutive_fail": self._consecutive_fail,
+            }
 
         if action == 'query':
             # 旧接口兼容
@@ -618,11 +746,17 @@ class TradeGateway:
         log("  账户: %s" % self.cfg['account_id'])
         log("  ZMQ: tcp://*:%d" % port)
         log("  接口: buy|sell|ping|query|query_account|query_position|query_orders|query_trades")
+        log("  健康检查: 盘中每分钟 (断线自动重连+重登)")
         log("  等待策略进程请求...")
         log("=" * 60)
 
+        # 启动健康检查线程
+        self._running = True
+        self._health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self._health_thread.start()
+
         try:
-            while True:
+            while self._running:
                 msg = self.zmq_socket.recv_string()
                 try:
                     req = json.loads(msg)
@@ -643,6 +777,7 @@ class TradeGateway:
         except Exception as e:
             log("❌ 网关异常: %s" % e)
         finally:
+            self._running = False
             self.cleanup()
 
     def cleanup(self):
