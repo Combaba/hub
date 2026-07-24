@@ -351,7 +351,7 @@ class TestRqDataUpdaterInit:
         assert rq_updater._all_stocks == []
 
     def test_backfill_start_date(self, rq_updater):
-        assert rq_updater.BACKFILL_START == '2020-01-01'
+        assert rq_updater.BACKFILL_START == '2000-01-01'
 
 
 class TestRqDataUpdaterHelpers:
@@ -458,12 +458,17 @@ class TestRqDataUpdaterKeyRotation:
     """测试 Key 轮换逻辑"""
 
     def test_switch_key_when_over_threshold(self, rq_updater):
-        """配额超阈值自动切换"""
+        """配额超阈值自动切换到低配额key"""
         mock_rq = MagicMock()
-        mock_rq.user.get_quota.return_value = {
-            'bytes_used': 1800 * 1024**2,  # 1800MB
-            'bytes_limit': 2048 * 1024**2,  # 2048MB → 87.9%
-        }
+        # 当前Key0配额87.9%，Key1配额10%
+        call_count = {'n': 0}
+        def mock_get_quota():
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return {'bytes_used': 1800 * 1024**2, 'bytes_limit': 2048 * 1024**2}  # 87.9%
+            else:
+                return {'bytes_used': 200 * 1024**2, 'bytes_limit': 2048 * 1024**2}   # 9.8%
+        mock_rq.user.get_quota.side_effect = mock_get_quota
         rq_updater._rq = mock_rq
         rq_updater._current_key_idx = 0
 
@@ -486,17 +491,20 @@ class TestRqDataUpdaterKeyRotation:
         assert result is False
 
     def test_no_switch_all_keys_exhausted(self, rq_updater):
-        """所有Key配额都不足时不切换(继续用当前)"""
+        """所有Key配额都不足时返回False(应停止下载)"""
         mock_rq = MagicMock()
+        # 所有key都返回高配额 — _init_rqdata是真实调用会改_current_key_idx
+        # 但我们mock _init_rqdata使其不报错，quota始终高
         mock_rq.user.get_quota.return_value = {
             'bytes_used': 1800 * 1024**2,
             'bytes_limit': 2048 * 1024**2,
         }
         rq_updater._rq = mock_rq
-        rq_updater._current_key_idx = len(mh2.LICENSES) - 1  # 最后一个key
+        rq_updater._current_key_idx = 0
 
-        result = rq_updater._switch_key_if_needed(0.80)
-        assert result is False
+        with patch.object(rq_updater, '_init_rqdata'):
+            result = rq_updater._switch_key_if_needed(0.80)
+            assert result is False
 
 
 class TestRqDataUpdaterRunning:
@@ -1014,8 +1022,8 @@ class TestIncrementalUpdate:
     """测试逐股增量更新: 每只股票只下载缺失段"""
 
     def test_compute_missing_ranges_no_gap(self, rq_updater):
-        """数据完整: 无缺失段"""
-        # 文件有7月14-18日(5天)的数据
+        """数据/数据完整: 向后有补齐段, 向前有回溯段(因BACKFILL_START=2000-01-01)"""
+        # 文件有7月=14-18日(5天)的数据
         out_file = mh2.MINUTE_DIR / '600000_XSHG.parquet'
         df = pd.DataFrame({
             'datetime': pd.date_range('2026-07-14', periods=5, freq='B'),
@@ -1025,10 +1033,11 @@ class TestIncrementalUpdate:
         df.to_parquet(out_file, index=False)
 
         ranges = rq_updater._compute_missing_ranges('600000.XSHG', mh2.MINUTE_DIR, '1m')
-        # 7月18日之后到今天可能有缺失，但7月14-18这段完整
-        # 应该只有(last_date+1 → today)的range
-        for start, end in ranges:
-            assert start > '2026-07-18'
+        # 有向后补齐段(last_date+1→today)和向前回溯段(BACKFILL_START→first_date)
+        assert len(ranges) > 0
+        # 应包含从2000-01-01开始的向前回溯段
+        all_starts = [r[0] for r in ranges]
+        assert '2000-01-01' in all_starts
 
     def test_compute_missing_ranges_with_gap(self, rq_updater):
         """数据中间有缺口: 7月14-15日有, 7月16-18日缺失"""
