@@ -1476,13 +1476,13 @@ class MarketHubV2:
         log.warning(f"🔄 ZMQ SUB自动重连: {addr}")
 
     def _check_zmq_health(self):
-        """检测ZMQ数据健康度: 盘中连续N分钟0消息则重连"""
+        """检测ZMQ数据健康度: 盘中连续N分钟0消息则重连(排除午休)"""
         now_min = int(time.time()) // 60
-        # 只在盘中检测 (9:15~15:05)
         from datetime import datetime
         now = datetime.now()
         t = now.hour * 100 + now.minute
-        in_market = (915 <= t <= 1505)
+        # 只在交易时段检测: 9:15~11:30, 13:00~15:05
+        in_market = (915 <= t <= 1130) or (1300 <= t <= 1505)
         if not in_market:
             self._zero_msg_minutes = 0
             return
