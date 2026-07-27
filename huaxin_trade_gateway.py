@@ -397,11 +397,10 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
         else:
             log("⚠️ 未找到交易所%s的股东账号, 股东账号缓存: %s" % (ex_id, self._shareholder_ids))
         if order_type == 'MARKET':
-            # 华鑫仿真不支持AnyPrice市价单, 改用限价+对手价模拟
-            # 买入用涨停价确保成交, 卖出用跌停价确保成交
-            # 这里先用限价类型, 价格由调用方设置(0则用当前价)
+            # 市价单已在handle_request转为限价+对手价, 不应走到这里
+            # 保留兼容: 如果直接调send_order, 仍需处理
             order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
-            order.LimitPrice = price if price > 0 else 0.001  # 盘中应传实际价格
+            order.LimitPrice = price if price > 0 else 0.001
         else:
             order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
             order.LimitPrice = price
@@ -584,6 +583,9 @@ class TradeGateway:
         self._running = False
         self._last_ping_ok = True
         self._consecutive_fail = 0
+        # 行情查询socket (连MarketHub REP:19802)
+        self._md_ctx = None
+        self._md_socket = None
 
     def connect_huaxin(self):
         """连接华鑫交易前置"""
@@ -725,7 +727,45 @@ class TradeGateway:
         addr = "tcp://*:%d" % port
         self.zmq_socket.bind(addr)
         log("✅ ZMQ交易网关: %s" % addr)
+        # 连接行情中心REP:19802 (获取对手价)
+        try:
+            self._md_ctx = zmq.Context()
+            self._md_socket = self._md_ctx.socket(zmq.REQ)
+            self._md_socket.setsockopt(zmq.RCVTIMEO, 3000)
+            self._md_socket.setsockopt(zmq.SNDTIMEO, 1000)
+            self._md_socket.connect("tcp://127.0.0.1:19802")
+            log("✅ 行情中心已连接: tcp://127.0.0.1:19802")
+        except Exception as e:
+            log("⚠️ 行情中心连接失败: %s (对手价不可用)" % e)
         return True
+
+    def _get_opposite_price(self, stock_code, direction):
+        """获取对手价: 买入→ask1, 卖出→bid1
+        从MarketHub REP:19802查询实时盘口
+        """
+        if not self._md_socket:
+            return 0
+        try:
+            self._md_socket.send_string(json.dumps({"action": "snapshot", "code": stock_code}))
+            resp_str = self._md_socket.recv_string()
+            resp = json.loads(resp_str)
+            if resp.get("ok") and resp.get("data"):
+                d = resp["data"]
+                if direction == 'BUY':
+                    price = d.get("ask1", 0)
+                    if price > 0:
+                        log("📋 对手价(买入ask1): %s ask1=%.3f" % (stock_code, price))
+                        return price
+                else:
+                    price = d.get("bid1", 0)
+                    if price > 0:
+                        log("📋 对手价(卖出bid1): %s bid1=%.3f" % (stock_code, price))
+                        return price
+            log("⚠️ 行情查询失败: %s, 无盘口数据" % stock_code)
+            return 0
+        except Exception as e:
+            log("⚠️ 行情查询异常: %s %s" % (stock_code, e))
+            return 0
 
     def handle_request(self, req):
         """处理请求"""
@@ -780,6 +820,20 @@ class TradeGateway:
             return {"ok": False, "error": "stock is required"}
 
         direction = 'BUY' if action == 'buy' else 'SELL'
+
+        # 市价单: 从行情中心获取对手价(买入ask1/卖出bid1), 转为限价单
+        # A股有2%价格笼子, 必须用对手价下单, 不能用涨跌停价
+        if order_type == 'MARKET':
+            opp_price = self._get_opposite_price(stock, direction)
+            if opp_price > 0:
+                log("📋 市价→限价(对手价): %s %s %.3f→%.3f" % (stock, direction, price, opp_price))
+                price = opp_price
+                order_type = 'LIMIT'
+            else:
+                # 行情不可用时, 若调用方传了价格则用之, 否则拒绝
+                if price <= 0:
+                    return {"ok": False, "error": "行情不可用, 无法获取对手价, 请传限价"}
+
         result = self.trader_spi.send_order(stock, shares, price, direction, order_type, reason)
         return result
 
@@ -838,6 +892,10 @@ class TradeGateway:
             self.zmq_socket.close()
         if self.zmq_ctx:
             self.zmq_ctx.term()
+        if self._md_socket:
+            self._md_socket.close()
+        if self._md_ctx:
+            self._md_ctx.term()
         log("网关退出")
 
 # ============================================================
