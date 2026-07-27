@@ -398,10 +398,14 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
             log("⚠️ 未找到交易所%s的股东账号, 股东账号缓存: %s" % (ex_id, self._shareholder_ids))
         if order_type == 'MARKET':
             # 市价单已在handle_request转为限价+对手价, 不应走到这里
-            # 保留兼容: 如果直接调send_order, 仍需处理
+            # 如果直接调send_order传MARKET, 必须提供有效价格
+            if price <= 0:
+                return {"ok": False, "error": "MARKET单必须通过handle_request转换, 或提供有效价格"}
             order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
-            order.LimitPrice = price if price > 0 else 0.001
+            order.LimitPrice = price
         else:
+            if price <= 0:
+                return {"ok": False, "error": "LIMIT单价格必须>0"}
             order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
             order.LimitPrice = price
         order.VolumeTotalOriginal = shares
@@ -635,6 +639,9 @@ class TradeGateway:
             return False
         log("✅ 华鑫交易重连成功")
         self._consecutive_fail = 0
+        # 重连后必须重新查询股东账号, 否则新SPI的_shareholder_ids为空→下单必被拒
+        log("📋 重连后重新查询股东账号...")
+        self.trader_spi.query_shareholder()
         return True
 
     def _is_trading_hours(self):

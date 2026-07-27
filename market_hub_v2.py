@@ -1688,29 +1688,36 @@ class MarketHubV2:
         23:00-23:59 — 消耗剩余配额，逐日向前补齐历史缺失数据 (24:00配额重置)
         """
         now = datetime.now()
-        # 任务1: 16:30 下载当日数据
-        # 修复: 启动时可能已下载过(数据不完整)，16:30必须重新下载
-        if now.hour == 16 and now.minute == 30:
+        # 任务1: 16:30-16:59 下载当日数据
+        # 窗口扩大到30分钟: 防止16:30时_running=True(启动时任务还在跑)导致任务永久丢失
+        # _last_today_download去重保证同一天只触发一次
+        if now.hour == 16 and now.minute >= 30:
             should_download = (
                 self.rq_updater._last_today_download is None or
                 self.rq_updater._last_today_download.date() != now.date() or
                 # 关键修复: 如果上次下载在16:30之前(启动时下载的)，需要重新下载完整数据
                 self.rq_updater._last_today_download.hour < 16
             )
-            if should_download:
+            # 检查_running防止重入
+            if should_download and not self.rq_updater._running:
                 log.info("⏰ 16:30 触发米筐当日下载(全市场A股)")
-                # 重置标记，允许重新下载
+                # 注意: 不再强制重置_running=False，避免多线程重入
                 self.rq_updater._last_today_download = None
-                self.rq_updater._running = False
                 threading.Thread(target=self.rq_updater.download_today_update,
                                  daemon=True).start()
-        # 任务2: 23:00-23:59 逐日补齐历史
-        if now.hour == 23 and 0 <= now.minute <= 59:
+        # 任务2: 23:00-23:05 逐日补齐历史
+        # 窗口扩大到5分钟: 防止23:00:00那秒主循环被ZMQ请求阻塞导致错过
+        # _last_backfill去重保证同一天只触发一次
+        if now.hour == 23 and now.minute <= 5:
             if self.rq_updater._last_backfill is None or \
                self.rq_updater._last_backfill.date() != now.date():
-                log.info("⏰ 23:00 触发米筐历史补齐(消耗剩余配额)")
-                threading.Thread(target=self.rq_updater.backfill_history,
-                                 daemon=True).start()
+                # 检查_running防止与16:30任务冲突
+                if not self.rq_updater._running:
+                    log.info("⏰ 23:00 触发米筐历史补齐(消耗剩余配额)")
+                    threading.Thread(target=self.rq_updater.backfill_history,
+                                     daemon=True).start()
+                else:
+                    log.warning("⏰ 23:00 历史补齐被跳过: 16:30下载任务仍在运行")
 
     def run(self):
         """主循环"""
