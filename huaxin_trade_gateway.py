@@ -103,6 +103,9 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
         # 重连相关
         self._disconnected = False
         self._reconnect_requested = False
+        # 股东账号缓存 {ExchangeID: ShareholderID}
+        self._shareholder_ids = {}
+        self._shareholder_loaded = False
 
     def _next_qry_id(self):
         with self._qry_lock:
@@ -143,6 +146,22 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
         except Exception as e:
             log("⚠️ OnRspUserLogin异常: %s" % e)
             self.login_event.set()
+
+    # ======== 股东账号查询回报 ========
+
+    def OnRspQryShareholderAccount(self, pShareholderAccountField, pRspInfoField, nRequestID, bIsLast):
+        try:
+            if pShareholderAccountField:
+                sid = safe_str(pShareholderAccountField.ShareholderID)
+                ex = pShareholderAccountField.ExchangeID
+                # 保持原始类型(与stock_to_exchange返回值一致)
+                self._shareholder_ids[ex] = sid
+                log("📋 股东账号: %s (交易所=%s, type=%s)" % (sid, ex, type(ex).__name__))
+            if bIsLast:
+                self._shareholder_loaded = True
+                log("📋 股东账号加载完成: %s" % self._shareholder_ids)
+        except Exception as e:
+            log("⚠️ OnRspQryShareholderAccount异常: %s" % e)
 
     # ======== 下单回报 ========
 
@@ -366,12 +385,23 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
 
         order = traderapi.CTORATstpInputOrderField()
         order.InvestorID = self.cfg['account_id']
-        order.SecurityID = stock_code[:6].encode()
+        order.SecurityID = stock_code[:6]
         order.ExchangeID = stock_to_exchange(stock_code)
         order.Direction = traderapi.TORA_TSTP_D_Buy if direction == 'BUY' else traderapi.TORA_TSTP_D_Sell
+        # 设置股东账号(华鑫SDK必填, 否则报"找不到股东账户")
+        ex_id = stock_to_exchange(stock_code)
+        shareholder_id = self._shareholder_ids.get(ex_id, '')
+        if shareholder_id:
+            order.ShareholderID = shareholder_id
+            log("📋 下单股东账号: %s (交易所=%s, 股票=%s)" % (shareholder_id, ex_id, stock_code))
+        else:
+            log("⚠️ 未找到交易所%s的股东账号, 股东账号缓存: %s" % (ex_id, self._shareholder_ids))
         if order_type == 'MARKET':
-            order.OrderPriceType = traderapi.TORA_TSTP_OPT_AnyPrice
-            order.LimitPrice = 0
+            # 华鑫仿真不支持AnyPrice市价单, 改用限价+对手价模拟
+            # 买入用涨停价确保成交, 卖出用跌停价确保成交
+            # 这里先用限价类型, 价格由调用方设置(0则用当前价)
+            order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
+            order.LimitPrice = price if price > 0 else 0.001  # 盘中应传实际价格
         else:
             order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
             order.LimitPrice = price
@@ -523,6 +553,21 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
         log("📊 成交查询: %d条记录" % len(result['data']))
         return {"ok": True, "data": result['data']}
 
+    def query_shareholder(self):
+        """查询股东账号"""
+        req = traderapi.CTORATstpQryShareholderAccountField()
+        req.InvestorID = self.cfg['account_id']
+        ret = self.__api.ReqQryShareholderAccount(req, 1)
+        if ret != 0:
+            return {"ok": False, "error": "ReqQryShareholderAccount返回%s" % ret}
+        # 等待回调填充_shareholder_ids (最多3秒)
+        import time
+        for _ in range(30):
+            if self._shareholder_loaded:
+                break
+            time.sleep(0.1)
+        return {"ok": True, "data": [{"ExchangeID": k, "ShareholderID": v} for k, v in self._shareholder_ids.items()]}
+
 
 # ============================================================
 # ZMQ交易网关服务
@@ -555,6 +600,11 @@ class TradeGateway:
         if not self.trader_spi.logged_in:
             log("❌ 华鑫交易登录失败")
             return False
+
+        # 登录成功后自动查询股东账号
+        log("📋 查询股东账号...")
+        self.trader_spi.query_shareholder()
+
         return True
 
     def _reconnect_huaxin(self):
@@ -710,6 +760,9 @@ class TradeGateway:
         if action == 'query_trades':
             return self.trader_spi.query_trades(stock=req.get('stock', ''))
 
+        if action == 'query_shareholder':
+            return self.trader_spi.query_shareholder()
+
         # === 交易接口 ===
         if action not in ('buy', 'sell'):
             return {"ok": False, "error": "unknown action: %s" % action}
@@ -745,7 +798,7 @@ class TradeGateway:
         log("  交易前置: %s" % self.cfg['td_front'])
         log("  账户: %s" % self.cfg['account_id'])
         log("  ZMQ: tcp://*:%d" % port)
-        log("  接口: buy|sell|ping|query|query_account|query_position|query_orders|query_trades")
+        log("  接口: buy|sell|ping|query|query_account|query_position|query_orders|query_trades|query_shareholder")
         log("  健康检查: 盘中每分钟 (断线自动重连+重登)")
         log("  等待策略进程请求...")
         log("=" * 60)
