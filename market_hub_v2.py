@@ -1657,19 +1657,16 @@ class MarketHubV2:
                 self.rq_updater._last_today_download = None
                 threading.Thread(target=self.rq_updater.download_today_update,
                                  daemon=True).start()
-        # 任务2: 23:00-23:05 逐日补齐历史
-        # 窗口扩大到5分钟: 防止23:00:00那秒主循环被ZMQ请求阻塞导致错过
-        # _last_backfill去重保证同一天只触发一次
-        if now.hour == 23 and now.minute <= 5:
-            if self.rq_updater._last_backfill is None or \
-               self.rq_updater._last_backfill.date() != now.date():
-                # 检查_running防止与16:30任务冲突
-                if not self.rq_updater._running:
-                    log.info("⏰ 23:00 触发米筐历史补齐(消耗剩余配额)")
-                    threading.Thread(target=self.rq_updater.backfill_history,
-                                     daemon=True).start()
-                else:
-                    log.warning("⏰ 23:00 历史补齐被跳过: 16:30下载任务仍在运行")
+        # 任务2: 23:00历史补齐 — 已禁用(用户要求停止)
+        # if now.hour == 23 and now.minute <= 5:
+        #     if self.rq_updater._last_backfill is None or \
+        #        self.rq_updater._last_backfill.date() != now.date():
+        #         if not self.rq_updater._running:
+        #             log.info("⏰ 23:00 触发米筐历史补齐(消耗剩余配额)")
+        #             threading.Thread(target=self.rq_updater.backfill_history,
+        #                              daemon=True).start()
+        #         else:
+        #             log.warning("⏰ 23:00 历史补齐被跳过: 16:30下载任务仍在运行")
 
     def run(self):
         """主循环"""
