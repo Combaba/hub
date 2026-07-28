@@ -864,9 +864,9 @@ class RqDataUpdater:
                 self._progress['phase'] = 'backfill_by_day'
                 self._backfill_by_day(rq, missing_days, self._all_stocks)
 
-            # Phase 4: 开盘5分钟tick数据(09:25-09:35, 含5档盘口)
-            self._progress['phase'] = 'backfill_open_tick'
-            self._download_open_tick(rq, self._all_stocks)
+            # Phase 4: 开盘5分钟tick — 已禁用(用户要求去掉tick下载)
+            # self._progress['phase'] = 'backfill_open_tick'
+            # self._download_open_tick(rq, self._all_stocks)
 
         except Exception as e:
             log.error(f"米筐历史补齐异常: {e}")
