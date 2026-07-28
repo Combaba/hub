@@ -440,66 +440,43 @@ class RqDataUpdater:
         return rq
 
     def _switch_key_if_needed(self, threshold=0.80):
-        """检查配额，超过阈值自动切换下一个可用key(循环尝试所有剩余key)
+        """检查Key1配额，超过阈值停止下载(不轮换)
         
-        返回: True=切换成功, False=所有Key配额不足(应停止下载)
+        返回: False=配额不足应停止下载
         """
         try:
             quota = self._rq.user.get_quota()
             pct = quota['bytes_used'] / quota['bytes_limit']
             if pct > threshold:
-                # 从下一个key开始，循环尝试所有剩余key
-                for offset in range(1, len(LICENSES)):
-                    next_idx = (self._current_key_idx + offset) % len(LICENSES)
-                    try:
-                        self._init_rqdata(next_idx)
-                        new_quota = self._rq.user.get_quota()
-                        new_pct = new_quota['bytes_used'] / new_quota['bytes_limit']
-                        if new_pct < threshold:
-                            log.warning(f"Key{self._current_key_idx+1}配额>{threshold*100:.0f}%，"
-                                       f"切换到Key{next_idx+1}(配额{new_pct*100:.1f}%)")
-                            return True
-                        else:
-                            log.warning(f"Key{next_idx+1}配额{new_pct*100:.1f}%也超阈值，继续尝试...")
-                    except Exception as e:
-                        log.warning(f"Key{next_idx+1}连接失败: {e}")
-                        continue
-                log.error(f"⚠ 所有{len(LICENSES)}个Key配额均不足，停止下载")
+                log.error(f"⚠ Key1配额{pct*100:.1f}%超过{threshold*100:.0f}%阈值，停止下载(不轮换)")
+                return False
             return False
         except Exception as e:
             log.error(f"配额检查异常: {e}")
             return False
 
     def _get_all_stocks(self, rq):
-        """获取全市场A股列表(过滤退市) — 配额超限自动切换key重试"""
-        for attempt in range(len(LICENSES)):
-            try:
-                all_inst = rq.all_instruments('CS')
-                # 用status过滤: 只保留Active状态的股票
-                # (de_listed_date是str类型,退市用'0000-00-00',isna()无效)
-                if 'status' in all_inst.columns:
-                    active = all_inst[all_inst['status'] == 'Active']
-                    stocks = active['order_book_id'].tolist()
-                else:
-                    # fallback: 过滤de_listed_date为空或'0000-00-00'的
-                    stocks = all_inst['order_book_id'].tolist()
-                    if 'de_listed_date' in all_inst.columns:
-                        today = date.today().isoformat()
-                        mask = (all_inst['de_listed_date'] == '0000-00-00') | \
-                               (all_inst['de_listed_date'] > today)
-                        stocks = all_inst.loc[mask, 'order_book_id'].tolist()
-                log.info(f"全市场A股: {len(stocks)}只 (活跃)")
-                return stocks
-            except Exception as e:
-                err_str = str(e)[:200]
-                log.error(f"获取全市场A股列表失败(尝试{attempt+1}/{len(LICENSES)}): {err_str}")
-                # 配额超限 → 切换key重试
-                if 'quota' in err_str.lower() or 'limit' in err_str.lower():
-                    if self._switch_key_if_needed(0.01):
-                        rq = self._rq  # 切换后更新rq引用
-                        log.info(f"已切换Key{self._current_key_idx+1}，重试获取A股列表...")
-                        continue
-                break  # 非配额错误，不重试
+        """获取全市场A股列表(过滤退市) — 固定Key1"""
+        try:
+            all_inst = rq.all_instruments('CS')
+            # 用status过滤: 只保留Active状态的股票
+            # (de_listed_date是str类型,退市用'0000-00-00',isna()无效)
+            if 'status' in all_inst.columns:
+                active = all_inst[all_inst['status'] == 'Active']
+                stocks = active['order_book_id'].tolist()
+            else:
+                # fallback: 过滤de_listed_date为空或'0000-00-00'的
+                stocks = all_inst['order_book_id'].tolist()
+                if 'de_listed_date' in all_inst.columns:
+                    today = date.today().isoformat()
+                    mask = (all_inst['de_listed_date'] == '0000-00-00') | \
+                           (all_inst['de_listed_date'] > today)
+                    stocks = all_inst.loc[mask, 'order_book_id'].tolist()
+            log.info(f"全市场A股: {len(stocks)}只 (活跃)")
+            return stocks
+        except Exception as e:
+            err_str = str(e)[:200]
+            log.error(f"获取全市场A股列表失败: {err_str}")
         return []
 
     def _get_last_date_from_parquet(self, filepath):
@@ -688,25 +665,13 @@ class RqDataUpdater:
             return False
         self._running = True
 
-        # 初始化: 从配额最充足的key开始(download_today_update)
+        # 固定使用Key1(2G配额), 不轮换
         rq = None
-        for start_idx in range(len(LICENSES)):
-            try:
-                rq = self._init_rqdata(start_idx)
-                quota = rq.user.get_quota()
-                pct = quota['bytes_used'] / quota['bytes_limit']
-                if pct < 0.95:
-                    log.info(f"✅ 从Key{start_idx+1}开始(配额{pct*100:.1f}%)")
-                    break
-                else:
-                    log.warning(f"Key{start_idx+1}配额{pct*100:.1f}%已超95%，尝试下一个...")
-                    rq = None
-            except Exception as e:
-                log.warning(f"Key{start_idx+1}连接失败: {e}")
-                continue
-
-        if rq is None:
-            log.error("❌ 所有Key配额不足或连接失败，无法执行当日下载")
+        try:
+            rq = self._init_rqdata(0)
+            log.info(f"✅ 使用Key1(2G配额)进行当日下载")
+        except Exception as e:
+            log.error(f"❌ Key1连接失败: {e}")
             self._running = False
             return False
 
@@ -808,7 +773,7 @@ class RqDataUpdater:
                 # 配额耗尽/连接数超限 → 尝试切换Key
                 if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                     if not self._switch_key_if_needed(0.5):
-                        log.error(f"  ⚠ 所有Key配额耗尽，停止当日下载 — 最后错误: {err_str}")
+                        log.error(f"  ⚠ Key1配额耗尽，停止当日下载 — 最后错误: {err_str}")
                         break
                     continue  # 切换成功,重试本批次
                 else:
@@ -844,26 +809,13 @@ class RqDataUpdater:
             return False
         self._running = True
 
-        # 初始化: 从配额最充足的key开始(backfill_history)
+        # 固定使用Key1(2G配额), 不轮换
         rq = None
-        for start_idx in range(len(LICENSES)):
-            try:
-                rq = self._init_rqdata(start_idx)
-                # 检查配额
-                quota = rq.user.get_quota()
-                pct = quota['bytes_used'] / quota['bytes_limit']
-                if pct < 0.95:
-                    log.info(f"✅ 从Key{start_idx+1}开始(配额{pct*100:.1f}%)")
-                    break
-                else:
-                    log.warning(f"Key{start_idx+1}配额{pct*100:.1f}%已超95%，尝试下一个...")
-                    rq = None
-            except Exception as e:
-                log.warning(f"Key{start_idx+1}连接失败: {e}")
-                continue
-
-        if rq is None:
-            log.error("❌ 所有Key配额不足或连接失败，无法执行历史补齐")
+        try:
+            rq = self._init_rqdata(0)
+            log.info(f"✅ 使用Key1(2G配额)进行历史补齐")
+        except Exception as e:
+            log.error(f"❌ Key1连接失败: {e}")
             self._running = False
             return False
 
@@ -873,7 +825,7 @@ class RqDataUpdater:
         if not self._all_stocks:
             self._all_stocks = self._get_all_stocks(rq)
         if not self._all_stocks:
-            log.error("无法获取A股列表(所有Key配额耗尽)，终止历史补齐")
+            log.error("无法获取A股列表(Key1配额耗尽)，终止历史补齐")
             self._running = False
             return False
 
@@ -1098,7 +1050,7 @@ class RqDataUpdater:
                 # 配额耗尽/连接数超限 → 尝试切换Key
                 if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                     if not self._switch_key_if_needed(0.5):
-                        log.error(f"  ⚠ 所有Key配额耗尽，停止补齐(明日23:00继续) — 最后错误: {err_str}")
+                        log.error(f"  ⚠ Key1配额耗尽，停止补齐(明日23:00继续) — 最后错误: {err_str}")
                         self._running = False
                         return done, failed
                     # 切换成功,继续重试本批次
@@ -1240,7 +1192,7 @@ class RqDataUpdater:
                     # 配额耗尽/连接数超限 → 尝试切换Key
                     if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                         if not self._switch_key_if_needed(0.5):
-                            log.error(f"  ⚠ 所有Key配额耗尽，停止历史补齐(明日23:00继续) — 最后错误: {err_str}")
+                            log.error(f"  ⚠ Key1配额耗尽，停止历史补齐(明日23:00继续) — 最后错误: {err_str}")
                             # 配额耗尽前先保存已下载的数据
                             if stock_dfs:
                                 combined = pd.concat(stock_dfs, ignore_index=True)
@@ -1352,7 +1304,7 @@ class RqDataUpdater:
                     # 配额耗尽/连接数超限 → 尝试切换Key
                     if 'quota' in err_str.lower() or 'limit' in err_str.lower() or 'login machine' in err_str.lower():
                         if not self._switch_key_if_needed(0.5):
-                            log.error(f"  ⚠ 所有Key配额耗尽，停止开盘tick下载 — 最后错误: {err_str}")
+                            log.error(f"  ⚠ Key1配额耗尽，停止开盘tick下载 — 最后错误: {err_str}")
                             return
                         continue  # 切换成功,重试
                     else:
