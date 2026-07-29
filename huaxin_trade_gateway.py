@@ -83,6 +83,16 @@ def safe_str(val):
 # ============================================================
 # 华鑫交易SPI
 # ============================================================
+def align_price_tick(price, stock_code=''):
+    """A股价格对齐最小变动单位(tick=0.01元)
+    华鑫仿真拒单原因: 价格非最小单位的倍数 / 委托价不正确
+    """
+    if price <= 0:
+        return price
+    # A股统一tick=0.01元
+    aligned = round(price, 2)
+    return aligned
+
 class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
     def __init__(self, api, cfg):
         traderapi.CTORATstpTraderSpi.__init__(self)
@@ -199,7 +209,11 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
                     'volume_original': pOrderField.VolumeTotalOriginal,
                     'volume_traded': pOrderField.VolumeTraded,
                 }
+            # 非最终状态也记录日志,方便排查
+            if status == traderapi.TORA_TSTP_OST_Accepted:
+                log("📋 订单已报: %s %s 委托%s成%s" % (stock, ss, pOrderField.VolumeTotalOriginal, pOrderField.VolumeTraded))
             if status in (traderapi.TORA_TSTP_OST_AllTraded,
+                         traderapi.TORA_TSTP_OST_PartTraded,
                          traderapi.TORA_TSTP_OST_AllCanceled,
                          traderapi.TORA_TSTP_OST_Rejected):
                 log("📋 订单回报: %s %s 委托%s成%s" % (stock, ss, pOrderField.VolumeTotalOriginal, pOrderField.VolumeTraded))
@@ -401,11 +415,13 @@ class HuaxinTraderSpi(traderapi.CTORATstpTraderSpi):
             # 如果直接调send_order传MARKET, 必须提供有效价格
             if price <= 0:
                 return {"ok": False, "error": "MARKET单必须通过handle_request转换, 或提供有效价格"}
+            price = align_price_tick(price, stock_code)
             order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
             order.LimitPrice = price
         else:
             if price <= 0:
                 return {"ok": False, "error": "LIMIT单价格必须>0"}
+            price = align_price_tick(price, stock_code)
             order.OrderPriceType = traderapi.TORA_TSTP_OPT_LimitPrice
             order.LimitPrice = price
         order.VolumeTotalOriginal = shares
@@ -597,6 +613,8 @@ class TradeGateway:
         self.trader_api = traderapi.CTORATstpTraderApi.CreateTstpTraderApi('')
         self.trader_spi = HuaxinTraderSpi(self.trader_api, self.cfg)
         self.trader_api.RegisterSpi(self.trader_spi)
+        self.trader_api.SubscribePrivateTopic(traderapi.TORA_TERT_RESUME)
+        self.trader_api.SubscribePublicTopic(traderapi.TORA_TERT_RESUME)
         self.trader_api.RegisterFront(self.cfg['td_front'])
         self.trader_api.Init()
 
@@ -628,6 +646,8 @@ class TradeGateway:
         self.trader_api = traderapi.CTORATstpTraderApi.CreateTstpTraderApi('')
         self.trader_spi = HuaxinTraderSpi(self.trader_api, self.cfg)
         self.trader_api.RegisterSpi(self.trader_spi)
+        self.trader_api.SubscribePrivateTopic(traderapi.TORA_TERT_RESUME)
+        self.trader_api.SubscribePublicTopic(traderapi.TORA_TERT_RESUME)
         self.trader_api.RegisterFront(self.cfg['td_front'])
         self.trader_api.Init()
 

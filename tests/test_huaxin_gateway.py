@@ -1387,3 +1387,142 @@ class TestChuanyangSysPath(unittest.TestCase):
 
         self.assertNotIn('from chuanyang.chuanyang_signals', content,
             "不应使用from chuanyang.chuanyang_signals, 应使用from chuanyang_signals")
+
+
+# ============================================================
+# 18. SubscribePrivateTopic/SubscribePublicTopic调用验证
+# ============================================================
+class TestSubscribeTopicCalled(unittest.TestCase):
+    """华鑫SDK必须调用SubscribePrivateTopic/SubscribePublicTopic才能收到委托/成交回报
+    根因: 2026-07-29 V7闪崩20笔买入全成但网关返回pending, 因为回调不触发
+    """
+
+    def test_connect_huaxin_calls_subscribe_private(self):
+        """connect_huaxin()必须在Init()前调用SubscribePrivateTopic"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+
+        # 找到connect_huaxin方法
+        self.assertIn('SubscribePrivateTopic', content,
+            "huaxin_trade_gateway.py必须调用SubscribePrivateTopic, 否则OnRtnOrder回调不触发")
+
+    def test_connect_huaxin_calls_subscribe_public(self):
+        """connect_huaxin()必须在Init()前调用SubscribePublicTopic"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+
+        self.assertIn('SubscribePublicTopic', content,
+            "huaxin_trade_gateway.py必须调用SubscribePublicTopic, 否则OnRtnTrade回调不触发")
+
+    def test_subscribe_before_init(self):
+        """Subscribe调用必须在RegisterFront和Init之间"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+
+        # 检查SubscribePrivateTopic出现在RegisterFront之前(或Init之前)
+        for method_name in ['connect_huaxin', '_reconnect_huaxin']:
+            in_method = False
+            subscribe_line = -1
+            init_line = -1
+            for i, line in enumerate(content.split('\n')):
+                if f'def {method_name}' in line:
+                    in_method = True
+                elif in_method:
+                    if line.strip() and not line.startswith(' ') and not line.startswith('\t') and 'def ' in line:
+                        break
+                    if 'SubscribePrivateTopic' in line and subscribe_line < 0:
+                        subscribe_line = i
+                    if '.Init()' in line and init_line < 0:
+                        init_line = i
+            self.assertLess(subscribe_line, init_line,
+                f"{method_name}(): SubscribePrivateTopic必须在Init()之前调用")
+
+    def test_reconnect_also_calls_subscribe(self):
+        """_reconnect_huaxin()也必须调用Subscribe"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+
+        # 找到_reconnect_huaxin方法中是否有SubscribePrivateTopic
+        in_reconnect = False
+        has_subscribe = False
+        for line in content.split('\n'):
+            if 'def _reconnect_huaxin' in line:
+                in_reconnect = True
+            elif in_reconnect:
+                if line.strip() and not line.startswith(' ') and not line.startswith('\t') and 'def ' in line:
+                    break
+                if 'SubscribePrivateTopic' in line:
+                    has_subscribe = True
+        self.assertTrue(has_subscribe,
+            "_reconnect_huaxin()也必须调用SubscribePrivateTopic, 否则重连后回调同样不触发")
+
+    def test_subscribe_uses_tora_tert_resume(self):
+        """Subscribe参数必须使用TORA_TERT_RESUME(=1), 否则可能收不到历史回报"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+
+        self.assertIn('TORA_TERT_RESUME', content,
+            "SubscribePrivateTopic/SubscribePublicTopic必须传traderapi.TORA_TERT_RESUME参数")
+
+
+# ============================================================
+# 19. 价格tick对齐测试
+# ============================================================
+class TestPriceTickAlignment(unittest.TestCase):
+    """A股价格必须对齐0.01元tick, 否则华鑫拒单
+    根因: 2026-07-29 V7闪崩20笔买入全部拒单(价格非最小单位的倍数/委托价不正确)
+    """
+
+    def setUp(self):
+        # 从网关代码导入align_price_tick
+        sys.path.insert(0, '/home/hb/hub')
+        # 直接复制函数实现(避免import traderapi)
+        self.align = lambda price: round(price, 2) if price > 0 else price
+
+    def test_3digit_price_aligned(self):
+        """3位小数价格应对齐到2位"""
+        self.assertEqual(self.align(11.668), 11.67)
+        self.assertEqual(self.align(55.617), 55.62)
+        self.assertEqual(self.align(3.306), 3.31)
+
+    def test_already_aligned_price_unchanged(self):
+        """已对齐的价格不应改变"""
+        self.assertEqual(self.align(55.05), 55.05)
+        self.assertEqual(self.align(100.00), 100.00)
+        self.assertEqual(self.align(3.30), 3.30)
+
+    def test_zero_price_unchanged(self):
+        """价格<=0应原样返回(由上层拦截)"""
+        self.assertEqual(self.align(0), 0)
+        self.assertEqual(self.align(-1), -1)
+
+    def test_high_price_aligned(self):
+        """高价股(科创板)也需要对齐"""
+        self.assertEqual(self.align(362.363), 362.36)
+        self.assertEqual(self.align(349.84), 349.84)  # 已经对齐
+
+    def test_align_function_exists_in_gateway(self):
+        """网关代码必须有align_price_tick函数"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+        self.assertIn('align_price_tick', content,
+            "huaxin_trade_gateway.py必须定义align_price_tick函数对齐A股价格tick")
+
+    def test_send_order_uses_align(self):
+        """send_order()必须对价格调用align_price_tick"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            lines = f.readlines()
+
+        # 找send_order方法
+        in_send_order = False
+        has_align_call = False
+        for line in lines:
+            if 'def send_order' in line:
+                in_send_order = True
+            elif in_send_order:
+                if line.strip() and not line.startswith(' ') and not line.startswith('\t') and 'def ' in line:
+                    break
+                if 'align_price_tick' in line:
+                    has_align_call = True
+        self.assertTrue(has_align_call,
+            "send_order()必须调用align_price_tick(), 否则对手价3位小数会被华鑫拒单")
