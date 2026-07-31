@@ -1615,11 +1615,36 @@ class TestParquetBarBackfill(unittest.TestCase):
     """
 
     def test_load_parquet_bars_stock_path(self):
-        """股票parquet路径: 000001.XSHE → /home/hb/data/stock_data/minute/000001_XSHE.parquet"""
-        hub_code = '000001.XSHE'
-        code_base = hub_code.replace('.', '_')
+        """股票parquet路径: 603065.SH → /home/hb/data/stock_data/minute/603065_XSHG.parquet"""
+        # 华鑫格式 .SH → 米筐格式 XSHG
+        hub_code = '603065.SH'
+        code_part = hub_code.split('.')[0]
+        suffix = hub_code.split('.')[-1]
+        rq_suffix = 'XSHG' if suffix == 'SH' else ('XSHE' if suffix == 'SZ' else suffix)
         from pathlib import Path
-        parquet_path = Path(f'/home/hb/data/stock_data/minute/{code_base}.parquet')
+        parquet_path = Path(f'/home/hb/data/stock_data/minute/{code_part}_{rq_suffix}.parquet')
+        self.assertEqual(str(parquet_path),
+            '/home/hb/data/stock_data/minute/603065_XSHG.parquet')
+
+    def test_load_parquet_bars_stock_sz_path(self):
+        """深圳股票parquet路径: 000001.SZ → /home/hb/data/stock_data/minute/000001_XSHE.parquet"""
+        hub_code = '000001.SZ'
+        code_part = hub_code.split('.')[0]
+        suffix = hub_code.split('.')[-1]
+        rq_suffix = 'XSHG' if suffix == 'SH' else ('XSHE' if suffix == 'SZ' else suffix)
+        from pathlib import Path
+        parquet_path = Path(f'/home/hb/data/stock_data/minute/{code_part}_{rq_suffix}.parquet')
+        self.assertEqual(str(parquet_path),
+            '/home/hb/data/stock_data/minute/000001_XSHE.parquet')
+
+    def test_load_parquet_bars_rq_format_passthrough(self):
+        """米筐格式直接透传: 000001.XSHE → /home/hb/data/stock_data/minute/000001_XSHE.parquet"""
+        hub_code = '000001.XSHE'
+        code_part = hub_code.split('.')[0]
+        suffix = hub_code.split('.')[-1]
+        rq_suffix = 'XSHG' if suffix == 'SH' else ('XSHE' if suffix == 'SZ' else suffix)
+        from pathlib import Path
+        parquet_path = Path(f'/home/hb/data/stock_data/minute/{code_part}_{rq_suffix}.parquet')
         self.assertEqual(str(parquet_path),
             '/home/hb/data/stock_data/minute/000001_XSHE.parquet')
 
