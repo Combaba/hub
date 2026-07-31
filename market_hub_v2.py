@@ -35,6 +35,7 @@ import argparse
 import logging
 import signal
 import threading
+import queue
 import asyncio
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -1364,6 +1365,11 @@ class MarketHubV2:
         self._snapshots = {}
         self._snap_lock = threading.Lock()
 
+        # 收数据/处理数据 分离: Queue
+        import queue
+        self._raw_queue = queue.Queue(maxsize=200000)  # 收数据→处理数据的桥梁
+        self._save_queue = queue.Queue(maxsize=200000)  # 处理数据→保存的桥梁
+
         # 统计
         self._msg_count = 0
         self._snap_count = 0
@@ -1376,6 +1382,7 @@ class MarketHubV2:
         self._reconnect_threshold = 3  # 连续3分钟0消息触发重连
         self._zero_msg_minutes = 0
         self._last_msg_minute = 0
+        self._need_reconnect = False  # 重连标志(线程安全：主线程设，recv线程执行)
 
     def connect(self):
         """连接远程ZMQ + 启动本地PUB/REP"""
@@ -1428,7 +1435,9 @@ class MarketHubV2:
         log.warning(f"🔄 ZMQ SUB自动重连: {addr}")
 
     def _check_zmq_health(self):
-        """检测ZMQ数据健康度: 盘中连续N分钟0消息则重连(排除午休)"""
+        """检测ZMQ数据健康度: 盘中连续N分钟0消息则标记需要重连(排除午休)
+        注意: 只设标志，不直接操作ZMQ socket(非线程安全)，由_recv_thread执行重连
+        """
         now_min = int(time.time()) // 60
         from datetime import datetime
         now = datetime.now()
@@ -1437,6 +1446,7 @@ class MarketHubV2:
         in_market = (915 <= t <= 1130) or (1300 <= t <= 1505)
         if not in_market:
             self._zero_msg_minutes = 0
+            self._need_reconnect = False
             return
 
         if self._msg_count > self._last_msg_minute:
@@ -1446,8 +1456,8 @@ class MarketHubV2:
         else:
             self._zero_msg_minutes += 1
             if self._zero_msg_minutes >= self._reconnect_threshold:
-                log.error(f"⚠️ ZMQ数据中断{self._zero_msg_minutes}分钟, 触发自动重连!")
-                self._reconnect_remote()
+                log.error(f"⚠️ ZMQ数据中断{self._zero_msg_minutes}分钟, 标记需要重连!")
+                self._need_reconnect = True
 
     def _process_remote_msg(self, frames):
         """处理远程ZMQ消息"""
@@ -1543,7 +1553,7 @@ class MarketHubV2:
             'ask1': snap['ask1'], 'ask_vol1': snap['ask_vol1'],
             'bid1': snap['bid1'], 'bid_vol1': snap['bid_vol1'],
         }
-        self.tick_saver.add(code, tick_record)
+        self._save_queue.put(tick_record, block=False)  # 放入保存队列，不阻塞处理线程
 
         # ★ K线聚合
         vol = snap['volume']
@@ -1578,7 +1588,7 @@ class MarketHubV2:
     def _handle_query(self):
         """处理ZMQ查询(兼容旧客户端)"""
         try:
-            if not self._query_rep.poll(100):
+            if not self._query_rep.poll(100):  # 查询线程独立运行，100ms等待合理
                 return
             msg = self._query_rep.recv_string()
             req = json.loads(msg)
@@ -1668,8 +1678,96 @@ class MarketHubV2:
         #         else:
         #             log.warning("⏰ 23:00 历史补齐被跳过: 16:30下载任务仍在运行")
 
+    def _recv_thread(self):
+        """线程1: 纯收数据 — 只做ZMQ接收，放入队列
+        注意: ZMQ Socket不是线程安全的，必须在本线程内创建和使用
+        """
+        log.info("✅ 收数据线程启动")
+        # 在本线程内创建ZMQ SUB socket
+        addr = f'tcp://{self.zmq_host}:{self.zmq_port}'
+        recv_sub = self._ctx.socket(zmq.SUB)
+        recv_sub.setsockopt_string(zmq.SUBSCRIBE, '')
+        recv_sub.setsockopt(zmq.RCVTIMEO, 5000)
+        recv_sub.setsockopt(zmq.RCVHWM, 500000)
+        recv_sub.setsockopt(zmq.LINGER, 0)
+        recv_sub.connect(addr)
+        log.info(f"✅ 收数据线程ZMQ连接: {addr}")
+
+        while self._running:
+            try:
+                # 批量接收: 非阻塞消费ZMQ缓冲区
+                batch = 0
+                for _ in range(500):
+                    try:
+                        frames = recv_sub.recv_multipart(zmq.NOBLOCK)
+                        self._raw_queue.put(frames, block=False)
+                        batch += 1
+                    except zmq.Again:
+                        break
+                    except queue.Full:
+                        break
+                if batch == 0:
+                    # 无数据时短暂等待
+                    time.sleep(0.001)
+            except zmq.ZMQError as e:
+                log.error(f"收数据ZMQ错误: {e}")
+                time.sleep(2)
+            except Exception as e:
+                log.error(f"收数据异常: {e}")
+                time.sleep(1)
+
+    def _process_thread(self):
+        """线程2: 处理数据 — 解析+聚合+分发+入保存队列"""
+        log.info("✅ 处理数据线程启动")
+        while self._running:
+            try:
+                # 批量从队列取数据
+                frames = self._raw_queue.get(timeout=0.1)
+                self._process_remote_msg(frames)
+                # 顺便消费队列中的剩余数据
+                for _ in range(200):
+                    try:
+                        frames = self._raw_queue.get_nowait()
+                        self._process_remote_msg(frames)
+                    except queue.Empty:
+                        break
+            except queue.Empty:
+                pass
+            except Exception as e:
+                log.error(f"处理数据异常: {e}")
+
+    def _save_thread(self):
+        """线程3: 保存数据 — tick写parquet，不阻塞收/处理"""
+        log.info("✅ 保存数据线程启动")
+        while self._running:
+            try:
+                tick_record = self._save_queue.get(timeout=1)
+                self.tick_saver.add(tick_record['code'], tick_record)
+                # 顺便消费队列中的剩余数据
+                for _ in range(500):
+                    try:
+                        tick_record = self._save_queue.get_nowait()
+                        self.tick_saver.add(tick_record['code'], tick_record)
+                    except queue.Empty:
+                        break
+            except queue.Empty:
+                pass
+            except Exception as e:
+                log.error(f"保存数据异常: {e}")
+
+    def _query_thread(self):
+        """线程4: ZMQ查询响应 — 独立线程，不阻塞其他逻辑"""
+        log.info("✅ 查询响应线程启动")
+        while self._running:
+            try:
+                self._handle_query()
+                time.sleep(0.001)  # 1ms间隔
+            except Exception as e:
+                log.error(f"查询响应异常: {e}")
+                time.sleep(0.1)
+
     def run(self):
-        """主循环"""
+        """主循环 — 四线程架构: 收数据 / 处理数据 / 保存数据 / 查询响应"""
         self._running = True
         self._start_time = time.time()
         self._last_report = time.time()
@@ -1681,6 +1779,7 @@ class MarketHubV2:
         log.info(f"K线PUB:  tcp://*:{self.bar_port}")
         log.info(f"查询REP: tcp://*:{self.query_port}")
         log.info(f"FastAPI: http://0.0.0.0:{self.api_port}")
+        log.info("架构: 收数据线程 → 处理数据线程 → 保存数据线程 + 查询响应线程")
         log.info("=" * 60)
 
         # 启动FastAPI(在子线程中)
@@ -1688,30 +1787,23 @@ class MarketHubV2:
         api_thread.start()
         log.info(f"✅ FastAPI已启动: http://0.0.0.0:{self.api_port}")
 
+        # 启动四个工作线程
+        t_recv = threading.Thread(target=self._recv_thread, daemon=True)
+        t_proc = threading.Thread(target=self._process_thread, daemon=True)
+        t_save = threading.Thread(target=self._save_thread, daemon=True)
+        t_query = threading.Thread(target=self._query_thread, daemon=True)
+        t_recv.start()
+        t_proc.start()
+        t_save.start()
+        t_query.start()
+
         while self._running:
             try:
-                # 接收远程行情
-                try:
-                    if self._remote_sub.poll(100):
-                        frames = self._remote_sub.recv_multipart()
-                        self._process_remote_msg(frames)
-                except zmq.Again:
-                    pass
-                except zmq.ZMQError as e:
-                    log.error(f"ZMQ错误: {e}")
-                    time.sleep(2)
-
-                # 处理ZMQ查询
-                self._handle_query()
-
-                # 统计
+                # 主线程只做: 统计 + 健康检查 + 定时任务
                 self._report_stats()
-
-                # ZMQ数据健康检测(每分钟)
                 self._check_zmq_health()
-
-                # 定时任务
                 self._check_scheduled_tasks()
+                time.sleep(1)  # 主线程1秒一次循环，避免_zero_msg_minutes疯涨
 
             except KeyboardInterrupt:
                 break
