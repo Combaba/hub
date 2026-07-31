@@ -665,11 +665,13 @@ class TradeGateway:
         return True
 
     def _is_trading_hours(self):
-        """是否在交易时段 (9:10~15:10), 午休11:35~12:55不算断线"""
+        """是否在交易时段 (8:40~15:10), 午休11:35~12:55不算断线
+        8:40起检测: 交易所8:45开始初始化, 盘前登录失败需及时重连
+        """
         now = datetime.now()
         t = now.hour * 100 + now.minute
-        # 盘前: 9:10 ~ 9:30
-        if 910 <= t < 930:
+        # 盘前预热: 8:40 ~ 9:30 (交易所8:45初始化, 需要重连)
+        if 840 <= t < 930:
             return True
         # 上午盘: 9:30 ~ 11:35
         if 930 <= t <= 1135:
@@ -867,8 +869,9 @@ class TradeGateway:
     def run(self, port):
         """主循环"""
         if not self.connect_huaxin():
-            log("❌ 华鑫交易连接失败，退出")
-            return False
+            # 首次登录失败不退出 — 交易所未初始化(08:44)等健康检查重连
+            log("⚠️ 华鑫交易首次登录失败，等待健康检查自动重连 (每分钟检测)")
+            # 不return False，继续启动ZMQ和健康检查
 
         if not self.start_zmq(port):
             log("❌ ZMQ启动失败，退出")

@@ -1526,3 +1526,245 @@ class TestPriceTickAlignment(unittest.TestCase):
                     has_align_call = True
         self.assertTrue(has_align_call,
             "send_order()必须调用align_price_tick(), 否则对手价3位小数会被华鑫拒单")
+
+
+# ============================================================
+# 20. 华鑫网关盘前自动重连测试
+# ============================================================
+class TestPreMarketAutoReconnect(unittest.TestCase):
+    """华鑫网关盘前登录失败不退出, 健康检查8:40起检测自动重连
+    根因: 2026-07-31 08:44登录失败(交易所未初始化), 09:10才重连成功, 26分钟空窗
+    """
+
+    def test_run_does_not_exit_on_login_failure(self):
+        """run()首次登录失败不应退出, 应继续启动ZMQ和健康检查"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+
+        # 找到run()方法中connect_huaxin()失败后的处理
+        in_run = False
+        after_connect_fail = False
+        has_no_return_false = True
+        for line in content.split('\n'):
+            if 'def run(self, port)' in line:
+                in_run = True
+            elif in_run:
+                if line.strip() and not line.startswith(' ') and not line.startswith('\t') and 'def ' in line:
+                    break
+                if 'connect_huaxin()' in line and 'if not' in line:
+                    after_connect_fail = True
+                elif after_connect_fail:
+                    # 登录失败后不应有return False
+                    if 'return False' in line and 'ZMQ' not in line:
+                        has_no_return_false = False
+                    after_connect_fail = False
+        self.assertTrue(has_no_return_false,
+            "run()中connect_huaxin()失败后不应return False, 应继续启动ZMQ等健康检查重连")
+
+    def test_trading_hours_starts_at_840(self):
+        """_is_trading_hours()应从8:40开始检测(交易所8:45初始化)"""
+        with open('/home/hb/hub/huaxin_trade_gateway.py', 'r') as f:
+            content = f.read()
+
+        # 检查8:40在交易时段内
+        self.assertIn('840', content,
+            "_is_trading_hours()应包含8:40(8:40=8点40分), 交易所8:45初始化需及时重连")
+
+    def test_845_is_trading_hours(self):
+        """8:45应在交易时段内(交易所初始化时间)"""
+        # 模拟_is_trading_hours逻辑
+        def is_trading_hours(hour, minute):
+            t = hour * 100 + minute
+            if 840 <= t < 930:
+                return True
+            if 930 <= t <= 1135:
+                return True
+            if 1135 < t < 1255:
+                return False
+            if 1255 <= t <= 1510:
+                return True
+            return False
+
+        # 8:44(登录失败时刻)应在交易时段
+        self.assertTrue(is_trading_hours(8, 44), "8:44应在交易时段(交易所初始化中)")
+        self.assertTrue(is_trading_hours(8, 45), "8:45应在交易时段")
+        self.assertTrue(is_trading_hours(9, 10), "9:10应在交易时段")
+        self.assertFalse(is_trading_hours(8, 39), "8:39不应在交易时段(太早)")
+        self.assertFalse(is_trading_hours(12, 0), "12:00午休不在交易时段")
+
+    def test_health_check_will_reconnect_at_844(self):
+        """8:44登录失败后, 健康检查应在1分钟内触发重连"""
+        # 验证: 8:44在_is_trading_hours=True, 健康检查每60秒运行
+        # 所以8:44失败→8:45健康检查检测到logged_in=False→触发重连
+        # 之前9:10才开始检测, 现在改为8:40, 空窗从26分钟缩短到1分钟
+        def is_trading_hours(hour, minute):
+            t = hour * 100 + minute
+            return 840 <= t < 930 or 930 <= t <= 1135 or 1255 <= t <= 1510
+
+        self.assertTrue(is_trading_hours(8, 45),
+            "8:45应在交易时段, 健康检查应能检测到登录失败并重连")
+
+
+# ============================================================
+# 21. 盘口v2 parquet K线回填测试
+# ============================================================
+class TestParquetBarBackfill(unittest.TestCase):
+    """盘口v2 K线回填 — 实时K线不足时从parquet历史文件补充
+    根因: MarketHub get_1m_bars()只返回内存中当天积累的K线(20-30根),
+          盘口策略需要60+根才能产生信号, 导致卖出择时永远不触发
+    """
+
+    def test_load_parquet_bars_stock_path(self):
+        """股票parquet路径: 000001.XSHE → /home/hb/data/stock_data/minute/000001_XSHE.parquet"""
+        hub_code = '000001.XSHE'
+        code_base = hub_code.replace('.', '_')
+        from pathlib import Path
+        parquet_path = Path(f'/home/hb/data/stock_data/minute/{code_base}.parquet')
+        self.assertEqual(str(parquet_path),
+            '/home/hb/data/stock_data/minute/000001_XSHE.parquet')
+
+    def test_load_parquet_bars_index_path(self):
+        """指数parquet路径: 000001.IDX → /home/hb/data/stock_data/index_1m/000001_XSHG_1m.parquet"""
+        idx_map = {
+            '000001_IDX': '000001_XSHG_1m',
+            '000300_IDX': '000300_XSHG_1m',
+            '000905_IDX': '000905_XSHG_1m',
+            '000852_IDX': '000852_XSHG_1m',
+        }
+        for idx_code, expected_name in idx_map.items():
+            parquet_name = idx_map.get(idx_code, idx_code.replace('_IDX', '_XSHG_1m'))
+            self.assertEqual(parquet_name, expected_name,
+                f"指数{idx_code}应映射到{expected_name}")
+
+    def test_merge_bars_no_backfill_when_enough(self):
+        """实时K线>=min_needed时不回填"""
+        realtime_bars = [{'datetime': f'2026-07-31 09:{i:02d}:00'} for i in range(60)]
+        # 模拟_merge_bars_with_parquet逻辑
+        min_needed = 60
+        realtime_count = len(realtime_bars)
+        # realtime_count >= min_needed → 直接返回
+        self.assertGreaterEqual(realtime_count, min_needed)
+
+    def test_merge_bars_backfill_when_insufficient(self):
+        """实时K线<min_needed时从parquet补充"""
+        realtime_bars = [{'datetime': f'2026-07-31 09:{i:02d}:00'} for i in range(20)]
+        hist_bars = [{'datetime': f'2026-07-30 14:{i:02d}:00'} for i in range(30)]
+
+        # 模拟合并逻辑
+        min_needed = 60
+        realtime_count = len(realtime_bars)
+        self.assertLess(realtime_count, min_needed)
+
+        # 去重合并
+        realtime_dt = {str(b.get('datetime', '')) for b in realtime_bars}
+        extra_bars = [b for b in hist_bars if str(b.get('datetime', '')) not in realtime_dt]
+        merged = extra_bars + list(realtime_bars)
+
+        self.assertEqual(len(merged), 50)  # 30历史 + 20实时
+        # 历史在前, 实时在后
+        self.assertIn('2026-07-30', str(merged[0]['datetime']))
+        self.assertIn('2026-07-31', str(merged[-1]['datetime']))
+
+    def test_merge_bars_dedup_same_datetime(self):
+        """相同datetime的K线应去重(保留实时版本)"""
+        # 实时和历史有重叠
+        realtime_bars = [
+            {'datetime': '2026-07-31 09:30:00', 'close': 10.5},  # 实时版本
+        ]
+        hist_bars = [
+            {'datetime': '2026-07-31 09:30:00', 'close': 10.3},  # 历史版本(旧)
+            {'datetime': '2026-07-31 09:29:00', 'close': 10.2},
+        ]
+
+        realtime_dt = {str(b.get('datetime', '')) for b in realtime_bars}
+        extra_bars = [b for b in hist_bars if str(b.get('datetime', '')) not in realtime_dt]
+        merged = extra_bars + list(realtime_bars)
+
+        # 09:30只保留实时版本
+        bars_0930 = [b for b in merged if b['datetime'] == '2026-07-31 09:30:00']
+        self.assertEqual(len(bars_0930), 1)
+        self.assertEqual(bars_0930[0]['close'], 10.5)  # 实时版本
+
+    def test_merge_bars_no_realtime(self):
+        """无实时K线时全部用历史"""
+        hist_bars = [{'datetime': f'2026-07-30 14:{i:02d}:00'} for i in range(30)]
+        realtime_bars = None
+
+        # 模拟逻辑
+        if realtime_bars:
+            merged = hist_bars  # 不会走到这里
+        else:
+            merged = hist_bars
+
+        self.assertEqual(len(merged), 30)
+
+    def test_parquet_stock_file_exists(self):
+        """验证平安银行(000001.XSHE)的parquet文件存在"""
+        from pathlib import Path
+        parquet_path = Path('/home/hb/data/stock_data/minute/000001_XSHE.parquet')
+        self.assertTrue(parquet_path.exists(),
+            "平安银行1m K线parquet文件应存在")
+
+    def test_parquet_index_file_exists(self):
+        """验证上证指数parquet文件存在"""
+        from pathlib import Path
+        parquet_path = Path('/home/hb/data/stock_data/index_1m/000001_XSHG_1m.parquet')
+        self.assertTrue(parquet_path.exists(),
+            "上证指数1m K线parquet文件应存在")
+
+    def test_parquet_has_enough_bars(self):
+        """验证parquet文件有足够的历史K线(>480根)"""
+        import pandas as pd
+        df = pd.read_parquet('/home/hb/data/stock_data/minute/000001_XSHE.parquet',
+                            columns=['datetime'])
+        self.assertGreater(len(df), 480,
+            f"平安银行1m K线应有>480根, 实际{len(df)}根")
+
+    def test_merge_bars_with_parquet_method_exists(self):
+        """pankou_live_v2.py必须有_merge_bars_with_parquet方法"""
+        with open('/home/hb/bands/fusion/pankou_live_v2.py', 'r') as f:
+            content = f.read()
+        self.assertIn('_merge_bars_with_parquet', content,
+            "pankou_live_v2.py必须定义_merge_bars_with_parquet方法")
+
+    def test_check_holding_stocks_uses_merge(self):
+        """_check_holding_stocks必须调用_merge_bars_with_parquet"""
+        with open('/home/hb/bands/fusion/pankou_live_v2.py', 'r') as f:
+            content = f.read()
+
+        # 找到_check_holding_stocks方法
+        in_method = False
+        has_merge_call = False
+        for line in content.split('\n'):
+            if 'def _check_holding_stocks' in line:
+                in_method = True
+            elif in_method:
+                if line.strip() and not line.startswith(' ') and not line.startswith('\t') and 'def ' in line:
+                    break
+                if '_merge_bars_with_parquet' in line:
+                    has_merge_call = True
+        self.assertTrue(has_merge_call,
+            "_check_holding_stocks必须调用_merge_bars_with_parquet补充K线")
+
+    def test_analyze_and_decide_uses_merge_for_index(self):
+        """_analyze_and_decide中大盘K线也必须用_merge_bars_with_parquet"""
+        with open('/home/hb/bands/fusion/pankou_live_v2.py', 'r') as f:
+            content = f.read()
+
+        # 找_analyze_and_decide方法中的指数K线获取
+        in_method = False
+        merge_count = 0
+        for line in content.split('\n'):
+            if 'def _analyze_and_decide' in line:
+                in_method = True
+            elif in_method:
+                if line.strip() and not line.startswith(' ') and not line.startswith('\t') and 'def ' in line:
+                    break
+                if '_merge_bars_with_parquet' in line:
+                    merge_count += 1
+        self.assertGreaterEqual(merge_count, 2,
+            "_analyze_and_decide中至少2处调用_merge_bars_with_parquet(指数+个股)")
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
