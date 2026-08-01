@@ -458,24 +458,21 @@ class TestRqDataUpdaterKeyRotation:
     """测试 Key 轮换逻辑"""
 
     def test_switch_key_when_over_threshold(self, rq_updater):
-        """配额超阈值自动切换到低配额key"""
+        """配额超阈值停止下载(不轮换Key)"""
         mock_rq = MagicMock()
-        # 当前Key0配额87.9%，Key1配额10%
-        call_count = {'n': 0}
-        def mock_get_quota():
-            call_count['n'] += 1
-            if call_count['n'] == 1:
-                return {'bytes_used': 1800 * 1024**2, 'bytes_limit': 2048 * 1024**2}  # 87.9%
-            else:
-                return {'bytes_used': 200 * 1024**2, 'bytes_limit': 2048 * 1024**2}   # 9.8%
-        mock_rq.user.get_quota.side_effect = mock_get_quota
+        # 当前Key1配额87.9%，超过80%阈值
+        mock_rq.user.get_quota.return_value = {
+            'bytes_used': 1800 * 1024**2, 'bytes_limit': 2048 * 1024**2  # 87.9%
+        }
         rq_updater._rq = mock_rq
         rq_updater._current_key_idx = 0
 
         with patch.object(rq_updater, '_init_rqdata') as mock_init:
             result = rq_updater._switch_key_if_needed(0.80)
-            assert result is True
-            mock_init.assert_called_once_with(1)
+            # 不轮换Key，配额超阈值返回False(停止下载)
+            assert result is False
+            # 不应调用_init_rqdata切换Key
+            mock_init.assert_not_called()
 
     def test_no_switch_under_threshold(self, rq_updater):
         """配额未超阈值不切换"""
@@ -554,7 +551,7 @@ class TestScheduledTasks:
                 assert mock_start.called
 
     def test_23_00_triggers_backfill(self):
-        """23:00触发历史补齐"""
+        """23:00历史补齐已禁用(用户要求停止)"""
         hub = mh2.MarketHubV2()
         hub.rq_updater._last_backfill = None
 
@@ -567,7 +564,8 @@ class TestScheduledTasks:
 
             with patch.object(threading.Thread, 'start') as mock_start:
                 hub._check_scheduled_tasks()
-                assert mock_start.called
+                # 23:00补齐已禁用，不应启动任何线程
+                assert not mock_start.called
 
     def test_no_trigger_at_12_00(self):
         """12:00不触发任何任务"""
