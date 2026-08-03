@@ -1382,6 +1382,7 @@ class MarketHubV2:
         self._reconnect_threshold = 3  # 连续3分钟0消息触发重连
         self._zero_msg_minutes = 0
         self._last_msg_minute = 0
+        self._last_check_min = 0  # 上次检查的分钟数(去重)
         self._need_reconnect = False  # 重连标志(线程安全：主线程设，recv线程执行)
 
     def connect(self):
@@ -1439,6 +1440,11 @@ class MarketHubV2:
         注意: 只设标志，不直接操作ZMQ socket(非线程安全)，由_recv_thread执行重连
         """
         now_min = int(time.time()) // 60
+        # 每分钟只检查一次
+        if now_min == self._last_check_min:
+            return
+        self._last_check_min = now_min
+
         from datetime import datetime
         now = datetime.now()
         t = now.hour * 100 + now.minute
@@ -1690,11 +1696,31 @@ class MarketHubV2:
         recv_sub.setsockopt(zmq.RCVTIMEO, 5000)
         recv_sub.setsockopt(zmq.RCVHWM, 500000)
         recv_sub.setsockopt(zmq.LINGER, 0)
+        recv_sub.setsockopt(zmq.RECONNECT_IVL, 1000)     # 首次重连1秒
+        recv_sub.setsockopt(zmq.RECONNECT_IVL_MAX, 5000) # 最大重连间隔5秒
         recv_sub.connect(addr)
         log.info(f"✅ 收数据线程ZMQ连接: {addr}")
 
         while self._running:
             try:
+                # 检查是否需要重连(由_check_zmq_health设置)
+                if self._need_reconnect:
+                    self._need_reconnect = False
+                    self._zero_msg_minutes = 0
+                    try:
+                        recv_sub.close()
+                    except Exception:
+                        pass
+                    recv_sub = self._ctx.socket(zmq.SUB)
+                    recv_sub.setsockopt_string(zmq.SUBSCRIBE, '')
+                    recv_sub.setsockopt(zmq.RCVTIMEO, 5000)
+                    recv_sub.setsockopt(zmq.RCVHWM, 500000)
+                    recv_sub.setsockopt(zmq.LINGER, 0)
+                    recv_sub.setsockopt(zmq.RECONNECT_IVL, 1000)
+                    recv_sub.setsockopt(zmq.RECONNECT_IVL_MAX, 5000)
+                    recv_sub.connect(addr)
+                    log.warning(f"🔄 收数据线程ZMQ自动重连: {addr}")
+
                 # 批量接收: 非阻塞消费ZMQ缓冲区
                 batch = 0
                 for _ in range(500):
